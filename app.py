@@ -1,138 +1,126 @@
 import streamlit as st
-import requests, re, os
-from bs4 import BeautifulSoup
 import pandas as pd
-from datetime import datetime
+import requests
+import os
 
-st.set_page_config(page_title="Analisador de FIIs", page_icon="📊", layout="wide")
+HIST_FILE = "historico_buscas.csv"
 
-# ========== Funções utilitárias ==========
-def clean_num(s):
-    if not s: return None
-    s = str(s).replace(".", "").replace(",", ".").replace("%","").strip()
-    try:
-        return float(s)
-    except:
-        return None
+# ------------------------
+# Funções auxiliares
+# ------------------------
 
-def fetch_investidor10(ticker: str) -> dict:
-    url = f"https://investidor10.com.br/fiis/{ticker.lower()}/"
-    r = requests.get(url, headers={"User-Agent":"Mozilla/5.0"})
+@st.cache_data
+def carregar_fundos_b3():
+    """Baixa lista completa de FIIs da B3"""
+    url = "https://sistemaswebb3-listados.b3.com.br/fundsProxy/fundsCall/GetListFundCarteira?PageNumber=1&PageSize=2000"
+    r = requests.get(url)
+    data = r.json()
+    fundos = []
+    for f in data.get("value", []):
+        fundos.append({
+            "Ticker": f.get("codNegociacao"),
+            "CNPJ": f.get("cnpj"),
+            "Nome": f.get("denomSocial")
+        })
+    return pd.DataFrame(fundos)
+
+@st.cache_data
+def get_info_fundo(cnpj):
+    """Consulta dados de um fundo na B3 pelo CNPJ"""
+    url = f"https://sistemaswebb3-listados.b3.com.br/fundsProxy/fundsCall/GetFundInfo?cnpj={cnpj}"
+    r = requests.get(url)
     if r.status_code != 200:
         return {}
+    return r.json()
 
-    soup = BeautifulSoup(r.text, "html.parser")
+def analisar_fundo(info):
+    """Extrai principais métricas"""
+    if not info:
+        return {}
 
-    def find_val(label):
-        el = soup.find(string=re.compile(label, re.I))
-        if not el: return None
-        nums = re.findall(r"[\d\.,]+%?", el.parent.get_text(" "))
-        if nums: return nums[-1]
-        return None
-
-    data = {
-        "Gestora": find_val("Gestor|Administra"),
-        "Ano de início": find_val("Início|Data"),
-        "Patrimônio líquido (R$ mi/bi)": find_val("Patrimônio Líquido"),
-        "Nº de cotistas": find_val("Cotistas"),
-        "Liquidez diária (R$ mi)": find_val("Liquidez|Volume"),
-        "Taxa de administração": find_val("Taxa de Administração"),
-        "Taxa de performance": find_val("Taxa de Performance"),
-        "Composição CRI (%)": find_val("CRI"),
-        "Composição cotas FII (%)": find_val("FII"),
-        "Composição permutas (%)": find_val("Permuta"),
-        "Composição caixa (%)": find_val("Caixa"),
-        "Classificação de risco": find_val("Risco|High|Middle|Grade"),
-        "Concentração maior ativo (%)": find_val("Concentração"),
-        "Alavancagem (%)": find_val("Alavancagem"),
-        "Dividend Yield 12m (%)": find_val("Dividend Yield|DY"),
-        "Dividend Yield 5a (%)": find_val("5 anos"),
-        "Rentab 2a (%)": find_val("2 anos"),
-        "Rentab 5a (%)": find_val("5 anos"),
-        "Rentab 10a (%)": find_val("10 anos"),
-        "P/VP": find_val("P/VP|P/VPA"),
-        "Fonte": "Investidor10"
+    return {
+        "Nome": info.get("denomSocial"),
+        "CNPJ": info.get("cnpj"),
+        "Patrimônio Líquido": info.get("vlPatrimonioLiquido"),
+        "Nº Cotistas": info.get("qtCotasEmitidas"),
+        "Liquidez Diária": info.get("vlVolumeNegociado"),
+        "P/VP": info.get("pvpa"),
+        "Dividend Yield (12m)": info.get("dy12Meses"),
+        "Rentabilidade (12m)": info.get("rentab12Meses")
     }
-    return data
 
-# ========== Histórico ==========
-COLUMNS = [
-    "Data","Ticker","Gestora","Ano de início","Patrimônio líquido (R$ mi/bi)","Nº de cotistas","Liquidez diária (R$ mi)",
-    "Taxa de administração","Taxa de performance","Composição CRI (%)","Composição cotas FII (%)","Composição permutas (%)",
-    "Composição caixa (%)","Classificação de risco","Concentração maior ativo (%)","Alavancagem (%)",
-    "Dividend Yield 12m (%)","Dividend Yield 5a (%)","Rentab 2a (%)","Rentab 5a (%)","Rentab 10a (%)","P/VP","Fonte","Notas"
-]
+def recomendacao(dados):
+    """Define se vale a pena ou não"""
+    try:
+        dy = float(dados.get("Dividend Yield (12m)", 0) or 0)
+        pvp = float(dados.get("P/VP", 0) or 0)
+    except:
+        return "⚪ Sem dados suficientes"
 
-def load_history():
-    if os.path.exists("analises.csv"):
-        return pd.read_csv("analises.csv")
-    return pd.DataFrame(columns=COLUMNS)
+    if dy > 10 and pvp < 1:
+        return "🟢 Bom ponto de entrada"
+    elif dy > 8 and pvp <= 1.05:
+        return "🟡 Razoável, mas atenção"
+    elif pvp > 1.1:
+        return "🔴 Caro no momento"
+    else:
+        return "⚪ Neutro"
 
-def save_history(df):
-    df.to_csv("analises.csv", index=False)
+def salvar_historico(df_novo):
+    """Salva ou atualiza histórico de buscas"""
+    if os.path.exists(HIST_FILE):
+        df_hist = pd.read_csv(HIST_FILE)
+        df_final = pd.concat([df_hist, df_novo]).drop_duplicates(subset=["CNPJ"], keep="last")
+    else:
+        df_final = df_novo
+    df_final.to_csv(HIST_FILE, index=False)
 
-# ========== Parecer automático ==========
-def parecer(row):
-    pvp = clean_num(row.get("P/VP"))
-    dy = clean_num(row.get("Dividend Yield 12m (%)"))
-    risco = str(row.get("Classificação de risco") or "").lower()
-    score, msgs = 0, []
+def carregar_historico():
+    if os.path.exists(HIST_FILE):
+        return pd.read_csv(HIST_FILE)
+    return pd.DataFrame()
 
-    if pvp:
-        if pvp < 0.95: score+=2; msgs.append("P/VP < 0,95 → Barato")
-        elif pvp <=1.05: score+=1; msgs.append("P/VP ≈ 1 → Justo")
-        else: score-=1; msgs.append("P/VP > 1,05 → Caro")
-    if dy:
-        if dy>=12: score+=2; msgs.append("DY alto")
-        elif dy>=9: score+=1; msgs.append("DY ok")
-        else: score-=1; msgs.append("DY baixo")
-    if "high" in risco: score-=1; msgs.append("Risco alto")
-    if "grade" in risco: score+=1; msgs.append("Risco baixo")
+# ------------------------
+# Interface do site
+# ------------------------
 
-    if score>=3: ver="✅ Vale a pena"
-    elif score>=1: ver="🟨 Neutro"
-    else: ver="❌ Não vale"
-    return ver," | ".join(msgs)
+st.set_page_config(page_title="Análises de FIIs", layout="wide")
+st.title("📊 Analisador de Fundos Imobiliários (FIIs)")
 
-# ========== Interface ==========
-st.title("📊 Analisador de FIIs (Investidor10)")
+# Carregar mapa FII ↔ CNPJ
+df_fundos = carregar_fundos_b3()
 
-ticker = st.text_input("Ticker do FII (ex: MXRF11)").upper()
+# Seleção de fundos
+tickers = df_fundos["Ticker"].dropna().unique()
+escolhidos = st.multiselect("Selecione os fundos:", options=sorted(tickers), default=["MXRF11", "VGHF11"])
 
-if st.button("Buscar"):
-    if ticker:
-        st.session_state["dados"] = fetch_investidor10(ticker)
+# Mostrar análises
+analises = {}
+for t in escolhidos:
+    cnpj = df_fundos.loc[df_fundos["Ticker"] == t, "CNPJ"].values[0]
+    info = get_info_fundo(cnpj)
+    dados = analisar_fundo(info)
+    if dados:
+        dados["Recomendação"] = recomendacao(dados)
+        analises[t] = dados
 
-dados = st.session_state.get("dados", {})
+if analises:
+    st.subheader("🔎 Análise dos Fundos")
+    df_result = pd.DataFrame(analises).T
+    st.dataframe(df_result, use_container_width=True)
 
-with st.form("form"):
-    st.subheader("📝 Revisar/editar dados antes de salvar")
-    edits = {}
-    for col in COLUMNS[2:-2]:  # pula Data/Ticker/Notas
-        edits[col] = st.text_input(col, dados.get(col,""))
-    notas = st.text_area("Notas", dados.get("Notas",""))
+    # Salvar histórico
+    salvar_historico(df_result.reset_index(drop=True))
 
-    ver, msg = parecer(edits)
-    st.info(f"Parecer: {ver} • {msg}")
+    # Comparação simples
+    if len(analises) > 1:
+        st.subheader("⚖️ Comparação")
+        st.dataframe(df_result.T, use_container_width=True)
 
-    if st.form_submit_button("Salvar"):
-        df = load_history()
-        row = {**edits}
-        row["Data"]=datetime.now().strftime("%Y-%m-%d")
-        row["Ticker"]=ticker
-        row["Notas"]=notas
-        df = pd.concat([df, pd.DataFrame([row])], ignore_index=True)
-        save_history(df)
-        st.success("Salvo!")
-
-# Histórico
-df = load_history()
-st.subheader("📂 Histórico")
-st.dataframe(df)
-
-# Comparação
-st.subheader("⚖️ Comparação entre fundos")
-choices = st.multiselect("Selecione fundos", df["Ticker"].unique())
-if len(choices)>=2:
-    comp = df[df["Ticker"].isin(choices)]
-    st.dataframe(comp)
+# Histórico de buscas
+st.subheader("📜 Histórico de Fundos Pesquisados")
+df_hist = carregar_historico()
+if not df_hist.empty:
+    st.dataframe(df_hist, use_container_width=True)
+else:
+    st.info("Nenhum histórico salvo ainda.")
