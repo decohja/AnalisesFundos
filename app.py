@@ -4,68 +4,42 @@ import requests
 import os
 
 HIST_FILE = "historico_buscas.csv"
+MAPA_FILE = "mapa_fundos.csv"
 
 # ------------------------
 # Funções auxiliares
 # ------------------------
 
-@st.cache_data
-def carregar_fundos_b3():
-    """Baixa lista completa de FIIs da B3"""
-    url = "https://sistemaswebb3-listados.b3.com.br/fundsProxy/fundsCall/GetListFundCarteira?PageNumber=1&PageSize=2000"
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-    }
+def carregar_mapa():
+    if os.path.exists(MAPA_FILE):
+        return pd.read_csv(MAPA_FILE, dtype=str)
+    else:
+        st.error("❌ Arquivo mapa_fundos.csv não encontrado.")
+        return pd.DataFrame(columns=["Ticker", "CNPJ", "Nome"])
+
+def get_info_fundo(cnpj):
+    """Consulta dados públicos da B3 para um fundo via endpoint detalhado"""
+    url = f"https://sistemaswebb3-listados.b3.com.br/fundsProxy/fundsCall/GetFundDetail?cnpj={cnpj}"
+    headers = {"User-Agent": "Mozilla/5.0"}
     try:
         r = requests.get(url, headers=headers, timeout=20)
         data = r.json()
     except Exception:
-        st.error("❌ Erro ao carregar dados da B3. Tente novamente mais tarde.")
-        return pd.DataFrame()
-
-    fundos = []
-    for f in data.get("value", []):
-        fundos.append({
-            "Ticker": f.get("codNegociacao"),
-            "CNPJ": f.get("cnpj"),
-            "Nome": f.get("denomSocial")
-        })
-    return pd.DataFrame(fundos)
-
-
-@st.cache_data
-def get_info_fundo(cnpj):
-    """Consulta dados de um fundo na B3 pelo CNPJ"""
-    url = f"https://sistemaswebb3-listados.b3.com.br/fundsProxy/fundsCall/GetFundInfo?cnpj={cnpj}"
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-    }
-    try:
-        r = requests.get(url, headers=headers, timeout=20)
-        return r.json()
-    except Exception:
         return {}
 
-
-def analisar_fundo(info):
-    """Extrai principais métricas"""
-    if not info:
-        return {}
-
+    value = data.get("value", {})
     return {
-        "Nome": info.get("denomSocial"),
-        "CNPJ": info.get("cnpj"),
-        "Patrimônio Líquido": info.get("vlPatrimonioLiquido"),
-        "Nº Cotistas": info.get("qtCotasEmitidas"),
-        "Liquidez Diária": info.get("vlVolumeNegociado"),
-        "P/VP": info.get("pvpa"),
-        "Dividend Yield (12m)": info.get("dy12Meses"),
-        "Rentabilidade (12m)": info.get("rentab12Meses")
+        "Nome": value.get("denomSocial"),
+        "CNPJ": value.get("cnpj"),
+        "Patrimônio Líquido": value.get("vlPatrimonioLiquido"),
+        "Nº Cotistas": value.get("qtCotasEmitidas"),
+        "Liquidez Diária": value.get("vlVolumeNegociado"),
+        "P/VP": value.get("pvpa"),
+        "Dividend Yield (12m)": value.get("dy12Meses"),
+        "Rentabilidade (12m)": value.get("rentab12Meses"),
     }
-
 
 def recomendacao(dados):
-    """Define se vale a pena ou não"""
     try:
         dy = float(dados.get("Dividend Yield (12m)", 0) or 0)
         pvp = float(dados.get("P/VP", 0) or 0)
@@ -81,16 +55,13 @@ def recomendacao(dados):
     else:
         return "⚪ Neutro"
 
-
 def salvar_historico(df_novo):
-    """Salva ou atualiza histórico de buscas"""
     if os.path.exists(HIST_FILE):
         df_hist = pd.read_csv(HIST_FILE)
         df_final = pd.concat([df_hist, df_novo]).drop_duplicates(subset=["CNPJ"], keep="last")
     else:
         df_final = df_novo
     df_final.to_csv(HIST_FILE, index=False)
-
 
 def carregar_historico():
     if os.path.exists(HIST_FILE):
@@ -104,20 +75,15 @@ def carregar_historico():
 st.set_page_config(page_title="Analisador de FIIs", layout="wide")
 st.title("📊 Analisador de Fundos Imobiliários (FIIs)")
 
-# Carregar mapa FII ↔ CNPJ
-df_fundos = carregar_fundos_b3()
-
-if not df_fundos.empty:
-    # Seleção de fundos
-    tickers = df_fundos["Ticker"].dropna().unique()
+mapa = carregar_mapa()
+if not mapa.empty:
+    tickers = mapa["Ticker"].dropna().unique()
     escolhidos = st.multiselect("Selecione os fundos:", options=sorted(tickers), default=["MXRF11", "VGHF11"])
 
-    # Mostrar análises
     analises = {}
     for t in escolhidos:
-        cnpj = df_fundos.loc[df_fundos["Ticker"] == t, "CNPJ"].values[0]
-        info = get_info_fundo(cnpj)
-        dados = analisar_fundo(info)
+        cnpj = mapa.loc[mapa["Ticker"] == t, "CNPJ"].values[0]
+        dados = get_info_fundo(cnpj)
         if dados:
             dados["Recomendação"] = recomendacao(dados)
             analises[t] = dados
@@ -127,15 +93,12 @@ if not df_fundos.empty:
         df_result = pd.DataFrame(analises).T
         st.dataframe(df_result, use_container_width=True)
 
-        # Salvar histórico
         salvar_historico(df_result.reset_index(drop=True))
 
-        # Comparação simples
         if len(analises) > 1:
             st.subheader("⚖️ Comparação")
             st.dataframe(df_result.T, use_container_width=True)
 
-# Histórico de buscas
 st.subheader("📜 Histórico de Fundos Pesquisados")
 df_hist = carregar_historico()
 if not df_hist.empty:
