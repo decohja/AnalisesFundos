@@ -7,54 +7,59 @@ from datetime import datetime
 
 st.set_page_config(page_title="Analisador de FIIs", page_icon="📊", layout="wide")
 
-# ======== COLETORES ========
-@st.cache_data(show_spinner=False, ttl=3600)
-def fetch_investidor10(ticker: str) -> dict:
-    url = f"https://investidor10.com.br/fiis/{ticker.lower()}/"
-    r = requests.get(url, headers={"User-Agent": "Mozilla/5.0"})
-    if r.status_code != 200:
-        return {}
-    soup = BeautifulSoup(r.text, "html.parser")
-
-    def find_value(label_patterns):
-        # procura um nó cujo texto case com algum dos padrões e tenta extrair o número próximo
-        label_node = None
-        for pat in label_patterns:
-            el = soup.find(string=re.compile(pat, re.I))
-            if el:
-                label_node = el
-                break
-        if not label_node:
-            return None
-        try:
-            parent = label_node.parent
-            # tenta pegar números (inclui % e vírgulas/pontos brasileiros)
-            text = parent.get_text(" ").strip()
-            nums = re.findall(r'[-+]?\d[\d\.\,]*%?', text)
-            if nums:
-                return nums[-1]
-            sib = parent.find_next()
-            if sib:
-                txt = sib.get_text(" ").strip()
-                nums = re.findall(r'[-+]?\d[\d\.\,]*%?', txt)
-                if nums:
-                    return nums[0]
-        except Exception:
-            pass
+# ----------------- Helpers -----------------
+def to_float_br(s):
+    if s is None: return None
+    s = str(s)
+    s = s.replace("\xa0"," ").replace("%","").strip()
+    # remove separador de milhar e troca vírgula por ponto
+    s = re.sub(r"[^\d,.\-]", "", s)
+    if s.count(",") == 1 and s.count(".") >= 1:
+        # padrão brasileiro (1.234,56)
+        s = s.replace(".", "").replace(",", ".")
+    elif s.count(",") == 1 and s.count(".") == 0:
+        s = s.replace(",", ".")
+    try:
+        return float(s)
+    except:
         return None
 
-    data = {
-        "Fonte": "Investidor10",
-        "Ticker": ticker.upper(),
-        "Dividend Yield 12m": find_value(["Dividend\\s*Yield", r"\bDY\b", "Dividendos"]),
-        "P/VP": find_value([r"P\/?\s*VP", "P/VPA"]),
-        "Patrimônio líquido": find_value(["Patrim[oô]nio.*l[ií]quido"]),
-        "Nº de cotistas": find_value(["Cotistas", "Número de cotistas"]),
-        "Liquidez diária": find_value(["Liquidez.*di[aá]ria", "Volume m[eé]dio"]),
-    }
-    # remove chaves vazias
-    return {k: v for k, v in data.items() if v}
+def plausibility_check(d):
+    """Descarta valores absurdos e retorna None quando inválido."""
+    out = dict(d)
+    dy = to_float_br(out.get("Dividend Yield 12m"))
+    if dy is None or dy < 0 or dy > 40:  # FIIs normalmente < 30–35%/a
+        out["Dividend Yield 12m"] = None
 
+    pvp = to_float_br(out.get("P/VP"))
+    if pvp is None or pvp < 0.4 or pvp > 1.8:
+        out["P/VP"] = None
+
+    pl = to_float_br(out.get("Patrimônio líquido"))
+    # muitas fontes trazem PL em bilhões/mi; aqui aceito qualquer número > 10
+    if pl is None or pl <= 10:
+        out["Patrimônio líquido"] = None
+
+    cot = to_float_br(out.get("Nº de cotistas"))
+    if cot is None or cot < 200:
+        out["Nº de cotistas"] = None
+
+    liq = to_float_br(out.get("Liquidez diária"))
+    if liq is None:
+        out["Liquidez diária"] = None
+
+    return out
+
+def merge_sources(primary, fallback):
+    """Prefere primary; completa campos faltantes com fallback."""
+    keys = ["Ticker","Dividend Yield 12m","P/VP","Patrimônio líquido","Nº de cotistas","Liquidez diária","Fonte"]
+    result = {k: primary.get(k) for k in keys}
+    for k in keys:
+        if (result.get(k) in [None, "", "N/A"]) and fallback:
+            result[k] = fallback.get(k)
+    return result
+
+# ----------------- Scrapers -----------------
 @st.cache_data(show_spinner=False, ttl=3600)
 def fetch_statusinvest(ticker: str) -> dict:
     url = f"https://statusinvest.com.br/fundos-imobiliarios/{ticker.lower()}"
@@ -67,7 +72,7 @@ def fetch_statusinvest(ticker: str) -> dict:
         el = soup.find("strong", {"title": title})
         return el.get_text(strip=True) if el else None
 
-    data = {
+    raw = {
         "Fonte": "StatusInvest",
         "Ticker": ticker.upper(),
         "Dividend Yield 12m": pick("Dividend Yield"),
@@ -76,11 +81,45 @@ def fetch_statusinvest(ticker: str) -> dict:
         "Nº de cotistas": pick("Número de cotistas"),
         "Liquidez diária": pick("Média volume diário"),
     }
-    return {k: v for k, v in data.items() if v}
+    return plausibility_check(raw)
 
-# ======== HISTÓRICO ========
+@st.cache_data(show_spinner=False, ttl=3600)
+def fetch_investidor10(ticker: str) -> dict:
+    # scraping mais "flexível" — pode quebrar se layout mudar
+    url = f"https://investidor10.com.br/fiis/{ticker.lower()}/"
+    r = requests.get(url, headers={"User-Agent": "Mozilla/5.0"})
+    if r.status_code != 200:
+        return {}
+
+    soup = BeautifulSoup(r.text, "html.parser")
+    text = soup.get_text(" ").strip()
+
+    def find_after(label_regex, want_percent=False):
+        m = re.search(label_regex, text, re.I)
+        if not m: return None
+        # pega uma janela de 120 chars depois do rótulo e busca o primeiro número
+        window = text[m.end(): m.end()+120]
+        if want_percent:
+            n = re.search(r"[-+]?\d[\d\.\,]*\s?%", window)
+        else:
+            n = re.search(r"[-+]?\d[\d\.\,]*", window)
+        return n.group(0).strip() if n else None
+
+    raw = {
+        "Fonte": "Investidor10",
+        "Ticker": ticker.upper(),
+        "Dividend Yield 12m": find_after(r"Dividend\s*Yield|DY\s*12", want_percent=True),
+        "P/VP": find_after(r"P\/?\s*VP|P\/VPA"),
+        "Patrimônio líquido": find_after(r"Patrim[oô]nio\s*l[ií]quido|PL\s*\(R\$"),
+        "Nº de cotistas": find_after(r"(N[uú]mero\s*de\s*)?cotistas"),
+        "Liquidez diária": find_after(r"Liquidez\s*di[aá]ria|Volume\s*m[eé]dio"),
+    }
+    return plausibility_check(raw)
+
+# ----------------- Storage -----------------
 def load_history() -> pd.DataFrame:
-    cols = ["Data","Ticker","Dividend Yield 12m","P/VP","Patrimônio líquido","Nº de cotistas","Liquidez diária","Fonte","Notas"]
+    cols = ["Data","Ticker","Dividend Yield 12m","P/VP",
+            "Patrimônio líquido","Nº de cotistas","Liquidez diária","Fonte","Notas"]
     path = "data/analises.csv"
     if os.path.exists(path):
         df = pd.read_csv(path)
@@ -94,25 +133,34 @@ def save_history(df: pd.DataFrame):
     os.makedirs("data", exist_ok=True)
     df.to_csv("data/analises.csv", index=False)
 
-# ======== UI ========
+# ----------------- UI -----------------
 st.title("📊 Analisador de FIIs")
-st.caption("Busque automaticamente (Investidor10/StatusInvest), edite e salve sua análise para comparar depois.")
+st.caption("Busca automática (StatusInvest → Investidor10 com validação), edição e histórico para comparação.")
 
 ticker = st.text_input("Ticker do FII (ex.: MXRF11)").strip().upper()
-col_pref1, col_pref2 = st.columns(2)
-with col_pref1:
-    fonte_pref = st.selectbox("Fonte preferida", ["Investidor10", "StatusInvest"])
+pref = st.selectbox("Fonte preferida", ["Automático (recomendado)", "StatusInvest", "Investidor10"])
 
 if st.button("Buscar dados"):
-    data = {}
-    if fonte_pref == "Investidor10":
-        data = fetch_investidor10(ticker) or fetch_statusinvest(ticker)
+    if not ticker:
+        st.warning("Informe o ticker.")
     else:
-        data = fetch_statusinvest(ticker) or fetch_investidor10(ticker)
-    if not data:
-        st.error("Não consegui coletar automaticamente. Preencha manualmente abaixo e salve.")
-        data = {"Ticker": ticker}
-    st.session_state["draft"] = data
+        if pref.startswith("Automático"):
+            a = fetch_statusinvest(ticker)
+            b = fetch_investidor10(ticker)
+            data = merge_sources(a, b)
+            if not a and b:
+                st.info("StatusInvest falhou; usei Investidor10.")
+            elif a and any(v is None for k,v in a.items() if k not in ["Fonte","Ticker"]):
+                st.info("Completei campos ausentes com Investidor10.")
+        elif pref == "StatusInvest":
+            data = fetch_statusinvest(ticker) or fetch_investidor10(ticker)
+        else:
+            data = fetch_investidor10(ticker) or fetch_statusinvest(ticker)
+
+        if not data:
+            st.error("Não consegui coletar automaticamente. Preencha manualmente abaixo e salve.")
+            data = {"Ticker": ticker}
+        st.session_state["draft"] = data
 
 draft = st.session_state.get("draft", {"Ticker": ticker} if ticker else {})
 
@@ -130,19 +178,19 @@ with st.form("form_save"):
     notas = st.text_area("Notas (opcional)", "")
     submitted = st.form_submit_button("Salvar análise")
     if submitted:
-        if not ticker:
-            st.warning("Informe o ticker.")
+        if not draft.get("Ticker"):
+            st.warning("Busque primeiro ou informe o ticker.")
         else:
             df = load_history()
             row = {
                 "Data": datetime.now().strftime("%Y-%m-%d"),
-                "Ticker": ticker,
+                "Ticker": draft.get("Ticker", ticker),
                 "Dividend Yield 12m": dy,
                 "P/VP": pvp,
                 "Patrimônio líquido": pl,
                 "Nº de cotistas": cot,
                 "Liquidez diária": liq,
-                "Fonte": fonte,
+                "Fonte": fonte or pref,
                 "Notas": notas
             }
             df = pd.concat([df, pd.DataFrame([row])], ignore_index=True)
@@ -173,31 +221,29 @@ if len(df) >= 2:
         comp = df[df["Ticker"].isin([f1, f2])]
         st.table(comp[["Ticker","Dividend Yield 12m","P/VP","Patrimônio líquido","Nº de cotistas","Liquidez diária","Fonte","Data"]])
 
-        def to_float(x):
-            if pd.isna(x): return None
-            x = str(x).replace("%","").replace(".","").replace(",",".")
-            try: return float(x)
-            except: return None
+        def nf(x):
+            try:
+                v = to_float_br(x)
+                return f"{v:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".") if v is not None else "-"
+            except:
+                return x
 
-        # Score simples (DY maior é melhor; P/VP mais próximo de 1 e <=1 é melhor)
         a, b = comp.iloc[0], comp.iloc[1]
+        st.markdown(f"**Resumo:** DY {a['Ticker']} = {nf(a['Dividend Yield 12m'])}% | P/VP = {nf(a['P/VP'])}  •  "
+                    f"DY {b['Ticker']} = {nf(b['Dividend Yield 12m'])}% | P/VP = {nf(b['P/VP'])}")
+
+        # Score simples (DY maior vence; P/VP <= 1 preferido; se os dois >1, vale o mais próximo de 1)
         scoreA = scoreB = 0
-        dy1, dy2 = to_float(a["Dividend Yield 12m"]), to_float(b["Dividend Yield 12m"])
-        pvp1, pvp2 = to_float(a["P/VP"]), to_float(b["P/VP"])
-
+        dy1, dy2 = to_float_br(a["Dividend Yield 12m"]), to_float_br(b["Dividend Yield 12m"])
+        pvp1, pvp2 = to_float_br(a["P/VP"]), to_float_br(b["P/VP"])
         if dy1 is not None and dy2 is not None:
-            if dy1 > dy2: scoreA += 1
-            elif dy2 > dy1: scoreB += 1
-
-        def pvp_penalty(p):  # quanto menor, melhor; preferimos <=1
-            if p is None: return 10
-            return abs(1 - p)
-
+            scoreA += dy1 > dy2
+            scoreB += dy2 > dy1
+        def pvp_penalty(p): return 10 if p is None else abs(1 - p)
         if pvp1 is not None and pvp2 is not None:
             if pvp1 <= 1 < pvp2: scoreA += 1
             elif pvp2 <= 1 < pvp1: scoreB += 1
             else:
-                if pvp_penalty(pvp1) < pvp_penalty(pvp2): scoreA += 1
-                elif pvp_penalty(pvp2) < pvp_penalty(pvp1): scoreB += 1
-
-        st.markdown(f"**Placar:** {a['Ticker']} {scoreA} × {scoreB} {b['Ticker']}")
+                scoreA += pvp_penalty(pvp1) < pvp_penalty(pvp2)
+                scoreB += pvp_penalty(pvp2) < pvp_penalty(pvp1)
+        st.markdown(f"**Placar:** {a['Ticker']} {int(scoreA)} × {int(scoreB)} {b['Ticker']}")
