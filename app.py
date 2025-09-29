@@ -13,8 +13,16 @@ HIST_FILE = "historico_buscas.csv"
 def carregar_fundos_b3():
     """Baixa lista completa de FIIs da B3"""
     url = "https://sistemaswebb3-listados.b3.com.br/fundsProxy/fundsCall/GetListFundCarteira?PageNumber=1&PageSize=2000"
-    r = requests.get(url)
-    data = r.json()
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    }
+    try:
+        r = requests.get(url, headers=headers, timeout=20)
+        data = r.json()
+    except Exception:
+        st.error("❌ Erro ao carregar dados da B3. Tente novamente mais tarde.")
+        return pd.DataFrame()
+
     fundos = []
     for f in data.get("value", []):
         fundos.append({
@@ -24,14 +32,20 @@ def carregar_fundos_b3():
         })
     return pd.DataFrame(fundos)
 
+
 @st.cache_data
 def get_info_fundo(cnpj):
     """Consulta dados de um fundo na B3 pelo CNPJ"""
     url = f"https://sistemaswebb3-listados.b3.com.br/fundsProxy/fundsCall/GetFundInfo?cnpj={cnpj}"
-    r = requests.get(url)
-    if r.status_code != 200:
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    }
+    try:
+        r = requests.get(url, headers=headers, timeout=20)
+        return r.json()
+    except Exception:
         return {}
-    return r.json()
+
 
 def analisar_fundo(info):
     """Extrai principais métricas"""
@@ -48,6 +62,7 @@ def analisar_fundo(info):
         "Dividend Yield (12m)": info.get("dy12Meses"),
         "Rentabilidade (12m)": info.get("rentab12Meses")
     }
+
 
 def recomendacao(dados):
     """Define se vale a pena ou não"""
@@ -66,6 +81,7 @@ def recomendacao(dados):
     else:
         return "⚪ Neutro"
 
+
 def salvar_historico(df_novo):
     """Salva ou atualiza histórico de buscas"""
     if os.path.exists(HIST_FILE):
@@ -74,6 +90,7 @@ def salvar_historico(df_novo):
     else:
         df_final = df_novo
     df_final.to_csv(HIST_FILE, index=False)
+
 
 def carregar_historico():
     if os.path.exists(HIST_FILE):
@@ -84,38 +101,39 @@ def carregar_historico():
 # Interface do site
 # ------------------------
 
-st.set_page_config(page_title="Análises de FIIs", layout="wide")
+st.set_page_config(page_title="Analisador de FIIs", layout="wide")
 st.title("📊 Analisador de Fundos Imobiliários (FIIs)")
 
 # Carregar mapa FII ↔ CNPJ
 df_fundos = carregar_fundos_b3()
 
-# Seleção de fundos
-tickers = df_fundos["Ticker"].dropna().unique()
-escolhidos = st.multiselect("Selecione os fundos:", options=sorted(tickers), default=["MXRF11", "VGHF11"])
+if not df_fundos.empty:
+    # Seleção de fundos
+    tickers = df_fundos["Ticker"].dropna().unique()
+    escolhidos = st.multiselect("Selecione os fundos:", options=sorted(tickers), default=["MXRF11", "VGHF11"])
 
-# Mostrar análises
-analises = {}
-for t in escolhidos:
-    cnpj = df_fundos.loc[df_fundos["Ticker"] == t, "CNPJ"].values[0]
-    info = get_info_fundo(cnpj)
-    dados = analisar_fundo(info)
-    if dados:
-        dados["Recomendação"] = recomendacao(dados)
-        analises[t] = dados
+    # Mostrar análises
+    analises = {}
+    for t in escolhidos:
+        cnpj = df_fundos.loc[df_fundos["Ticker"] == t, "CNPJ"].values[0]
+        info = get_info_fundo(cnpj)
+        dados = analisar_fundo(info)
+        if dados:
+            dados["Recomendação"] = recomendacao(dados)
+            analises[t] = dados
 
-if analises:
-    st.subheader("🔎 Análise dos Fundos")
-    df_result = pd.DataFrame(analises).T
-    st.dataframe(df_result, use_container_width=True)
+    if analises:
+        st.subheader("🔎 Análise dos Fundos")
+        df_result = pd.DataFrame(analises).T
+        st.dataframe(df_result, use_container_width=True)
 
-    # Salvar histórico
-    salvar_historico(df_result.reset_index(drop=True))
+        # Salvar histórico
+        salvar_historico(df_result.reset_index(drop=True))
 
-    # Comparação simples
-    if len(analises) > 1:
-        st.subheader("⚖️ Comparação")
-        st.dataframe(df_result.T, use_container_width=True)
+        # Comparação simples
+        if len(analises) > 1:
+            st.subheader("⚖️ Comparação")
+            st.dataframe(df_result.T, use_container_width=True)
 
 # Histórico de buscas
 st.subheader("📜 Histórico de Fundos Pesquisados")
