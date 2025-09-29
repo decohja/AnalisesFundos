@@ -22,9 +22,8 @@ def fetch_investidor10(ticker: str) -> dict:
         return {}
 
     soup = BeautifulSoup(r.text, "html.parser")
-    text = soup.get_text(" ").lower()
 
-    def find_val(label, percent=False):
+    def find_val(label):
         el = soup.find(string=re.compile(label, re.I))
         if not el: return None
         nums = re.findall(r"[\d\.,]+%?", el.parent.get_text(" "))
@@ -36,7 +35,7 @@ def fetch_investidor10(ticker: str) -> dict:
         "Ano de início": find_val("Início|Data"),
         "Patrimônio líquido (R$ mi/bi)": find_val("Patrimônio Líquido"),
         "Nº de cotistas": find_val("Cotistas"),
-        "Liquidez diária (R") : find_val("Liquidez|Volume"),
+        "Liquidez diária (R$ mi)": find_val("Liquidez|Volume"),
         "Taxa de administração": find_val("Taxa de Administração"),
         "Taxa de performance": find_val("Taxa de Performance"),
         "Composição CRI (%)": find_val("CRI"),
